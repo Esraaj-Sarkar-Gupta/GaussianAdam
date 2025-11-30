@@ -1,0 +1,543 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+\usepackage{mdframed}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+
+\usepackage[
+    backend=biber,
+    style=numeric,   % or ieee, numeric, apa, etc.
+    sorting=none
+]{biblatex}
+
+\addbibresource{refs.bib}  % your .bib file
+
+
+\usepackage{listings}
+\usepackage[left=2cm, right=2cm, top=2cm, bottom=2cm]{geometry}
+
+\setlength{\parindent}{0pt}
+
+\usepackage{enumitem}
+
+\lstset{
+    numbers=left,                % Line numbers on the left
+    numberstyle=\tiny\color{gray}, % Line number style (small, gray)
+    stepnumber=1,                % Number every line
+    numbersep=5pt,               % Distance between line numbers and code
+    frame=single,                % Adds a border around the code
+    framesep=10pt,               % Space between code and the border
+    backgroundcolor=\color{white}, % Background color (optional)
+    showstringspaces=false,      % Don't highlight spaces in strings
+    keywordstyle=\color{blue},   % Keyword color (optional)
+    commentstyle=\color{green},  % Comment color (optional)
+    stringstyle=\color{red},     % String color (optional)
+    breaklines=true,             % Break long lines
+    breakatwhitespace=true,      % Break lines at spaces
+    basicstyle=\ttfamily\small
+}
+\usepackage{xcolor}
+
+\title{GaussianAdam}
+\author{Esraaj Sarkar Gupta}
+\date{November 2025}
+
+\begin{document}
+
+\begin{titlepage}
+    \centering
+    {\Huge \bfseries GaussianAdam \\[0.3cm]}
+    {\huge A Noise-Driven Variant of Adam\par}
+
+    \vspace{1.5cm}
+
+    {\Large Esraaj Sarkar Gupta\par}
+    {\Large Vedanth Kapoor, Reya Saigal, Anahad Singh\par} % Other Authors
+    \vspace{1cm}
+    {\large \today\par}
+
+    \vfill
+    {\Large \href{https://github.com/Esraaj-Sarkar-Gupta/GaussianAdam}{\texttt{Project Codebase: https://github.com/Esraaj-Sarkar-Gupta/GaussianAdam}}\par}
+    \vspace{1cm}
+    {\large Plaksha University} % Footer (Dept name, etc)
+\end{titlepage}
+
+\textbf{\Large Abstract}\\
+\textbf{\textit{
+    While Adaptive Moment Estimation is the standard for training deep neural networks due to its stability and speed, it frequently converges to suboptimal local minima in non-convex loss landscapes. This report introduces GaussianAdam, a stochastic variant of the Adam optimizer that incorporates a time-decaying, positive folded Gaussian noise term directly into the learning rate. By treating the learning rate as a stochastic process, GaussianAdam facilitates a "jump-and-settle" dynamic -- a high initial variance enables the traversal or high-energy barriers in the loss-surface to escape local basins, while a decay mechanism anneals the optimizer over time to a stable, deterministic trajectory (similar to Adam) to settle into a minimum.\\
+    \\
+    This report evaluates GaussianAdam across multiple convex and non-convex benchmark functions, including ill-conditioned quadratics, the Rosenbrock function, the Rastrigin function, as well as a Multi-Layer Perceptron of MNIST. Experimental results demonstrate that GaussianAdam outperforms standard Adam in global optimization tasks -- traversing a multimodal Rastrigin function where Adam stalls, while retaining comparable (or in some cases better) convergence speed and stability on convex, ill-curved loss surfaces. It demonstrates comparable accuracy to Adam on the MNIST Neural Network Training. The findings in this report suggest that positive-bias noise injection offers a robust method for improving exploration without sacrificing the convergence guarantees of Adaptive Moment Estimation. 
+}}
+
+\section{Introduction}
+Among first order optimizers, Adaptive Moment Estimation, or Adam, is the most stable and widely deployed modern optimizer due to its robustness across architectures, resilience to gradient noise, and consistent performance without sensitive hyperparameter tuning. This is in contrast to other first order gradient descent based optimizers such as Stochastic Gradient Descent (SGD), Nesterov Accelerated Gradient (NAG), Root Mean Squared Propulsion (RMSProp), Adaptive Gradient Descent (AdaGrad), etc. which tend to either explode or stall under the same conditions.\\
+\\
+Despite the stability and efficiency that Adam exhibits in smooth and curved optimization landscapes, it struggles to find global optimums in non-convex functions containing multiple local minima, periodic structures, flat regions or saddle points\cite{fotopoulos2024}. Gradient descent based optimizers, including adaptive optimizers are known to stall in such landscapes. In such circumstances, noise-driven methods (such as Stochastic Gradient Langevin Dynamics -- SGLD) are necessary to escape suboptimal basins and explore the parameter space more effectively.\\
+\\
+Although Adam excels as a local optimizer, it is not well suited for global optimization problems where exploration is critical. The aim of this report is to build a stochastic adaptive moment estimation based optimizer that is capable of performing on non-convex parameter spaces while preserving the stability and efficiency of Adam.\\
+\\
+\textbf{Inspiration}\\
+The idea of using a stochastic optimizer is, of course, not novel: plenty of noise-based samplers are already in deployment. One such popular candidate, mentioned previously, is Stochastic Gradient Langevin Dynamics (SGLD). SGLD is most used in Bayesian deep learning to approximate Bayesian posterior distributions as a lighter substitute to a full Monte-Carlo Markov Chain (MCMC) approach.\\
+\\
+Although both methods mentioned above are based on Bayesian statistics and are typically slower and more complicated to tune, and are used as exploratory samplers, not optimizers, they both have structured Gaussian noise (such as Gaussian neighborhood sampling in Metropolis Hastings MCMC) as a part of their algorithm. In order to make an exploratory optimizer motivated by stochasticity\cite{neelakantan2015gradientnoise}, one may consider using a heuristic that samples a Gaussian distribution. Where the heuristic may be applied remains a task of simple trial-and-error.\\
+\\
+Many possibilities were considered, such as adding / multiplying the noise directly to the parameters, the first or second moments, but best results were obtained from adding the noise directly to the learning parameter. It was taken into account that a noisy learning rate may prevent the optimizer from converging at any point. In order to solve this problem, it was decided that the variance of the Gaussian distribution that the noise term samples will be decreased with every step, necessitating the introduction of a new hyperparameter -- the variance decay constant. Future iterations of the optimizer may include a rolling hyperparameter.
+
+\section{Methodology and Algorithm}
+GaussianAdam attempts to tackle non-convex loss surfaces by adding controlled noise to the learning parameter of the standard Adam algorithm\cite{kingma2014adam}. The Adam update functions unchanged for a function $f(\vec{\theta})$ where the gradient in step $t$ is given by $g_t = \nabla_\theta f(\vec{\theta_t})$ are described below.\\
+\\
+\textbf{\Large Adaptive Moment Estimation -- Adam}\\
+\\
+\textbf{The first (momentum) and second (velocity or RMS) moment updates}
+
+\begin{eqnarray}
+    m_t & = & \beta_1\,m_{t-1} + (1 - \beta_1)g_t \label{first_moment_update}\\
+    v_t & = & \beta_2\,v_{t - 1} + (1 - \beta_2)g_t^2 \label{second_moment_update}
+\end{eqnarray}
+
+\textbf{Bias correction} 
+
+\begin{eqnarray}
+    \hat{m}_t & = & \frac{m_t}{(1 - \beta_1^t)} \label{first_moment_bias_correction} \\
+    \hat{v}_t & = & \frac{v_t}{(1 - \beta_2^t)} \label{{second_moment_bias_correction}}
+\end{eqnarray}
+
+\textbf{Parameter Update}
+
+\begin{eqnarray}
+    \theta_{t+1} & = & \theta_t - \alpha \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+    \label{AdamUpdate}
+\end{eqnarray}
+
+where,
+\begin{eqnarray}
+    \beta_1 & \in & (0,1) \text{ is the momentum decay,} \nonumber \\
+    \beta_2 & \in & (0,1) \text{ is the second moment decay,} \nonumber \\
+    \alpha & > & 0 \text{ is the learning rate,} \nonumber \\
+    \epsilon & \ll & 1 \text{ is a very small number for divisional stability.} \nonumber
+\end{eqnarray}
+
+The GaussianAdam algorithm differs in the addition of a single step-dependent stochastic parameter $\xi_t$  sampled from a right-tailed Gaussian distribution directly to the learning rate $\alpha$. Effectively, the learning rate is transformed to be a function of time.\
+
+\begin{equation}
+    \alpha \mapsto \alpha_t = \alpha_0 + \xi_t
+\end{equation}
+
+The GaussianAdam algorithm builds on the existing Adam method by introducing a new "noisy" term, along with a hyperparameter $\gamma$ -- the decay of the variance of the Gaussian noise.\\
+
+\textbf{\Large Gaussian Adaptive Moment Estimation -- GaussianAdam}\\
+\\
+\textbf{The first (momentum) and second (velocity or RMS) moment updates}
+
+\begin{eqnarray}
+    m_t & = & \beta_1\,m_{t-1} + (1 - \beta_1)g_t \nonumber\\
+    v_t & = & \beta_2\,v_{t - 1} + (1 - \beta_2)g_t^2 \nonumber
+\end{eqnarray}
+
+\textbf{Bias correction} 
+
+\begin{eqnarray}
+    \hat{m}_t & = & \frac{m_t}{(1 - \beta_1^t)} \nonumber \\
+    \hat{v}_t & = & \frac{v_t}{(1 - \beta_2^t)} \nonumber
+\end{eqnarray}
+
+\textbf{Noise Term Sampling and Updates}
+
+\begin{eqnarray}
+    \xi_t & = & |\mathcal{N}(0, \sigma_t^2)| \label{gaussian_sampling} \\
+    \sigma_{t+1} & = & (1 - \gamma)\;\sigma_t
+\end{eqnarray}
+
+\textbf{Parameter Update}
+
+\begin{eqnarray}
+    \theta_{t+1} & = & \theta_t - \alpha_0(1 + \xi_t) \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+    \label{GaussianAdam_update}
+\end{eqnarray}
+
+where,
+\begin{eqnarray}
+    \beta_1 & \in & (0,1) \text{ is the momentum decay,} \nonumber \\
+    \beta_2 & \in & (0,1) \text{ is the second moment decay,} \nonumber \\
+    \sigma_0 & > & 0 \text{ is the initial noise standard deviation} \nonumber \\
+    \gamma & \in & (0,1) \text{ is the standard deviation decay, } \nonumber \\
+    \alpha_0 & > & 0 \text{ is the base learning rate,} \nonumber \\
+    \epsilon & \ll & 1 \text{ is a very small number for divisional stability.} \nonumber
+\end{eqnarray}
+
+
+\begin{mdframed}[backgroundcolor=gray!10]
+\textbf{Remark: }
+An earlier formulation of Eq. \ref{gaussian_sampling} and Eq. \ref{GaussianAdam_update} was the inclusion of the base learning rate $\alpha_0$ directly in the mean of a two tailed Gaussian distribution (as opposed to the right-tailed Gaussian that GaussianAdam uses now) being sampled from.
+
+\begin{eqnarray}
+    \xi_t & \sim & \mathcal{N}(\alpha_0, \sigma_t^2) \label{alternate_gaussian_sampling} \\
+    \theta_{t+1} & = & \theta_t - \xi_t \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+    \label{alternate_GaussianAdam_upate}
+\end{eqnarray}
+
+After testing it was found that this formulation was outperformed by that of the formulation outlined in Eq. \ref{GaussianAdam_update}. The older formulation lead to negative or excessively large learning rates. The idea was to leave the expected value of the learning rate $E[\alpha_t] = E[\alpha_0 + \xi_t]$ = $\alpha_0$. Retrospectively, it's fairly obvious that all this did was add directionless noise to the optimizer that did nothing but increase convergence time.\\
+\\
+\end{mdframed}
+
+Such a formulation gives the optimizer a sufficient degree of noise as it starts allowing to explore the parameter space more aggressively, which then slowly begins to decay as each step progresses. With a well-chosen standard deviation decay $\gamma$, the variance decays enough to mimic pure Adam as it approaches the optimum. Table \ref{noise_decay} demonstrates the decay of noise with step size for different decay rates.\\
+\\
+\begin{table}[!h]
+\centering
+\begin{tabular}{|c|c|c|}
+\hline
+\includegraphics[width=0.33\linewidth]{ExampleNoiseDecay/NoiseDecay_01.png} &
+\includegraphics[width=0.33\linewidth]{ExampleNoiseDecay/NoiseDecay_001.png} &
+\includegraphics[width=0.33\linewidth]{ExampleNoiseDecay/NoiseDecay_0001.png} \\
+\hline
+\end{tabular}
+\caption{The decay of sampled noise as the variance decay parameter is adjusted.}
+\label{noise_decay}
+\end{table}
+The orange line -- termed the expectation curve represents the expected value of the right-tailed Gaussian variable as the variance decays with step size. This value is given by the equation
+
+\begin{equation}
+    E[\xi_t] = \sigma_t \sqrt{\frac{2d}{\pi}}
+\end{equation}
+
+where $d$ is the dimension of the noise vector.
+
+% Write about expected learning rate -> effective learning rate due to the right-tailed gaussian
+% Include images from Gaussian decay
+
+\begin{algorithm}[H]
+\caption{GaussianAdam}
+\label{alg:gaussianadam}
+\begin{algorithmic}[1]
+\Require Initial parameters $\theta_0$, learning rate $\alpha_0$, 
+         $\beta_1, \beta_2 \in (0,1)$, standard deviation decay $\gamma \in (0,1)$,
+         initial noise standard deviation $\sigma_0$, small constant $\epsilon$
+\State Initialize $m_0 \gets 0$, $v_0 \gets 0$, $t \gets 0$, $\sigma \gets \sigma_0$
+\For{$t = 1,2,3,\dots$}
+    \State Compute gradient $g_t = \nabla_\theta f(\theta_t)$
+    \State $m_t \gets \beta_1 m_{t-1} + (1 - \beta_1) g_t$
+    \State $v_t \gets \beta_2 v_{t-1} + (1 - \beta_2) g_t^2$
+    \State $\hat{m}_t \gets \dfrac{m_t}{1 - \beta_1^t}$
+    \State $\hat{v}_t \gets \dfrac{v_t}{1 - \beta_2^t}$
+    \State Sample noise term: $\xi_t \sim |\mathcal{N}(0, \sigma^2)|$
+    \State $\sigma \gets (1 - \gamma)\,\sigma$  \Comment{standard deviation decay}
+    \State Effective learning rate: $\alpha_t \gets \alpha_0 (1 + \xi_t)$
+    \State Update parameters:
+    \[
+        \theta_{t+1} \gets \theta_t 
+        - \alpha_t \dfrac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+    \]
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\section{Benchmark Testing Results}
+In this section, first performance of GaussianAdam is assessed on standard benchmarks for evaluating gradient-descent based optimizers and compared against the performance of other well-known gradient-descent algorithms.\\
+\\
+All the algorithms are given a common learning rate of \textbf{$\alpha_0 = \alpha = 0.02$} in the following benchmarks unless and otherwise mentioned. All other gradient-descent algorithms are given their default hyperparameter values (would be included in an Appendix).\\
+\\
+GaussianAdam is given the following default hyperparameters:
+\begin{eqnarray}
+    \beta_1 & = & 0.9 \text{ (Adam default)}\nonumber\\
+    \beta_2 & = & 0.999 \text{ (Adam default)}\nonumber \\
+    \gamma & = & 0.001 \nonumber \\
+    \sigma_{(t=0)} & = & 1 \text{ (Initial noise standard deviation)}
+\end{eqnarray}
+
+\subsection{Quadratic Functions}
+In order to evaluate the baseline convergence speed and numerical stability, a standard convex quadratic objective is introduced:
+
+\begin{equation}
+    f(x) = \frac{1}{2}x^\text{T}Qx \label{well-conditioned_quadratic}
+\end{equation}
+
+where $Q$ is a symmetric positive definite matrix. A useful function $\kappa(Q)$ is defined as the ratio of the largest eigenvalue to the smallest eigenvalue of matrix $Q$.
+
+\begin{equation}
+    \kappa = \frac{\lambda_\text{max}(Q)}{\lambda_\text{min}}. \label{kappa_of_Q}
+\end{equation}
+
+\subsubsection{Well-Conditions Quadratic Function}
+
+For any such quadratic functions, where $\kappa(Q)$ is small is said to be a well conditioned quadratic. Here we consider a quadratic with $\kappa = 10$.\\
+\\
+Such functions are widely used are fundamental benchmarks since they isolate the pure convergence behavior of an algorithm, without complications from non-linearity, curvature or non-convexity. An example run of various gradient-descent based algorithms on such a function have been shown in Fig. \ref{fig:wcQ_iterations} and Table \ref{tab:wcQ_benchmark}. 
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.5\linewidth]{wcQ/iterartions1.png}
+    \caption{Well Conditioned Quadratic -- Example Number of Iterations for Convergence}
+    \label{fig:wcQ_iterations}
+\end{figure}
+\begin{table}[!h]
+    \centering
+    \begin{tabular}{|c|c|}
+    \hline
+    \includegraphics[width=0.4\linewidth]{wcQ/time1.png}&
+    \includegraphics[width=0.4\linewidth]{wcQ/noise1.png}\\
+    \hline
+    \end{tabular}
+    \caption{Well Conditioned Quadratic Benchmark}
+    \label{tab:wcQ_benchmark}
+\end{table}
+
+From Fig. \ref{fig:wcQ_iterations}, we see that GaussianAdam converges with fewer iterations than Adam and SGD. It fails to beat the remainder of optimizers considered. As shown in Table \ref{tab:wcQ_benchmark}, Adam is the only optimizer that takes longer than GaussianAdam.
+
+\subsubsection{Ill-Conditioned Quadratic Function}
+If one were to consider a much larger conditioning number $\kappa$, the resultant quadratic function may be instead termed an ill-conditioned quadratic. These functions introduce significant curvature disparity across directions, producing long, narrow level sets. Such surfaces are especially difficult for momentum-based gradient descent algorithms. Here we consider a function where \textbf{$\kappa = 200$.}\\
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.5\linewidth]{icQ/iterations.png}
+    \caption{Ill Conditioned Quadratic -- Example Number of Iterations for Convergence}
+    \label{fig:icQ_iterations}
+\end{figure}
+\begin{table}[!h]
+    \centering
+    \begin{tabular}{|c|c|}
+    \hline
+    \includegraphics[width=0.4\linewidth]{icQ/runtimes.png}&
+    \includegraphics[width=0.4\linewidth]{icQ/noise.png}\\
+    \hline
+    \end{tabular}
+    \caption{Ill Conditioned Quadratic Benchmark}
+    \label{tab:icQ_benchmark}
+\end{table}
+
+We see that GaussianAdam comfortably beats both AdaGrad and Adam in an ill-conditioned quadratic function. Adagrad does beat GaussianAdam in terms of runtime, but that result can be attributed to the simplicity of Adagrad's update sequence in comparison to Adam or GaussianAdam. With similar learning rates, the functions considered previously for the well-conditioned quadratic function fail in this benchmark, either stalling (RMSProp) or exploding (NAG).\\
+\\
+Given that GaussianAdam is a stochastic optimizer, it is important to note that there will be inherent differences in each run -- where some runs perform exceedingly well. In order to better represent the performance of GaussianAdam, a 100 runs of GaussianAdam were carried out on the functions mentioned above, and the runtime and number of iterations from each run was recorded. The means and variances of the number of iterations until convergence, and the total runtime for each run have been presented in Table \ref{tab:gaussianAdam_averages_quadratics} and Table \ref{tab:gaussianAdam_averages_quadratics_figures}.
+
+\begin{table}[h!]
+    \centering
+    \begin{tabular}{|c|c|c|c|c|}
+        \hline
+        \textbf{Conditioning Number} & 
+        \textbf{Mean Iters} & 
+        \textbf{Std Iters} & 
+        \textbf{Mean Time (s)} & 
+        \textbf{Std Time (s)} \\ \hline
+
+        $\kappa = 10$ & 157.71 & 2.53 & 0.00182 & 0.00009 \\ \hline
+        $\kappa = 200$ & 423.11 & 10.54 & 0.00484 & 0.00017 \\ \hline
+
+    \end{tabular}
+    \caption{Average performance of GaussianAdam across 100 runs on well-conditioned and ill-conditioned quadratic benchmarks.}
+    \label{tab:gaussianAdam_averages_quadratics}
+\end{table}
+
+
+\begin{table}[h!]
+    \centering
+    \begin{tabular}{|c|c|}
+    \hline
+    \includegraphics[width=0.5\linewidth]{quadratics_avg_performance/iterations.png} &
+    \includegraphics[width=0.5\linewidth]{quadratics_avg_performance/runtime.png} \\
+    \hline
+    \end{tabular}
+    \caption{Average number of iterations (left) and average runtime of GaussianAdam in well-conditioned and ill-conditioned quadratic functions.}
+    \label{tab:gaussianAdam_averages_quadratics_figures}
+\end{table}
+
+\subsection{Rosenbrock Function}
+The Rosenbrock function, also sometimes referred to as the "Banana Shaped Valley" function, and a popular benchmark to test optimizers due to its ill-shaped curvature. The 2D Rosenbrock function\cite{rosenbrock1960} is
+
+\begin{equation}
+    f(x,y) = (1-x)^2 + 100(y - x^2)^2. \label{Rosenbrock_function}
+\end{equation}
+
+Among all the standard gradient-descent based algorithms discussed for far, Adam is the only function that is capable of traversing the parameter space without exploding. With a well tuned standard deviation decay parameter $\gamma$, GaussianAdam should be able to find the valley early (earlier than Adam), and the noise must decay enough to ensure that GaussianAdam does not "jump" out of the valley.\\
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.5\linewidth]{RsB/iterations.png}
+    \caption{Rosenbrock Function -- Example Number of Iterations for Convergence}
+    \label{fig:RsB_iterations}
+\end{figure}
+\begin{table}[!h]
+    \centering
+    \begin{tabular}{|c|c|}
+    \hline
+    \includegraphics[width=0.4\linewidth]{RsB/runtimes.png}&
+    \includegraphics[width=0.4\linewidth]{RsB/noise.png}\\
+    \hline
+    \end{tabular}
+    \caption{Rosenbrock Function Benchmark}
+    \label{tab:RsB_benchmark}
+\end{table}
+
+It is observed that GaussianAdam is able to converge to a minimum with significantly fewer iterations than Adam, although maintaining a comparable runtime. A statistical analysis of GaussianAdam's performance is outlined in Table \ref{tab:gaussianAdam_averages_rosenbrock} and Table \ref{tab:gaussianAdam_averages_quadratics_figures}, arrived at by carrying out 100 runs of GaussianAdam on the Rosenbrock function surface.\\
+
+\begin{table}[h!]
+    \centering
+    \begin{tabular}{|c|c|c|c|c|}
+        \hline
+        \textbf{Benchmark} & 
+        \textbf{Mean Iters} & 
+        \textbf{Std Iters} & 
+        \textbf{Mean Time (s)} & 
+        \textbf{Std Time (s)} \\ \hline
+
+        Rosenbrock & 2547.46 & 95.84 & 0.02799 & 0.00196 \\ \hline
+
+    \end{tabular}
+    \caption{Average performance of GaussianAdam across 100 runs on the Rosenbrock benchmark function.}
+    \label{tab:gaussianAdam_averages_rosenbrock}
+\end{table}
+
+\begin{table}[h!]
+    \centering
+    \begin{tabular}{|c|c|}
+    \hline
+    \includegraphics[width=0.5\linewidth]{rosen_avg_performance/iterations.png} &
+    \includegraphics[width=0.5\linewidth]{rosen_avg_performance/runtime.png} \\
+    \hline
+    \end{tabular}
+    \caption{Average number of iterations (left) and average runtime (right) of GaussianAdam in the Rosenbrock function.}
+    \label{tab:gaussianAdam_averages_rosenbrock_figures}
+\end{table}
+
+Adam takes $2875$ iterations to converge (under these fixed parameters). From Table \ref{tab:gaussianAdam_averages_rosenbrock} we see that GaussianAdam has a mean iteration count of $2547.46$, and a standard deviation of $95.84$ iterations. It is evident that Adam's convergence is placed over 3 standard deviations from the mean number of iterations GaussianAdam requires to converge.
+
+\subsection{MNIST}
+The MNIST Neural Network Benchmark is used as a benchmark for optimizers -- introducing high-dimensional noisy gradient estimates, along with a non-convex loss surface. In such higher dimensional surfaces, local minima are rare, however saddle points do come up as problems where standard optimizers such as Adam can stall\cite{dauphin2014saddle}. Hypothetically, one may use a stochastic sampler such as GaussianAdam to escape these saddle points.\\
+\\
+However, it is observed that in the MNIST benchmark, GaussianAdam is unable to surpass Adam in terms of accuracy or runtime.\\
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.5\linewidth]{MNIST/iterations.png}
+    \caption{MNIST Neural Network -- Example Number of Iterations for Convergence}
+    \label{fig:MNIST_iterations}
+\end{figure}
+\begin{table}[!h]
+    \centering
+    \begin{tabular}{|c|c|}
+    \hline
+    \includegraphics[width=0.4\linewidth]{MNIST/runtimes.png}&
+    \includegraphics[width=0.4\linewidth]{MNIST/noise.png}\\
+    \hline
+    \end{tabular}
+    \caption{MNIST Neural Network Benchmark}
+    \label{tab:MNIST_benchmark}
+\end{table}
+
+From GaussianAdam's learning rate $\alpha_t = \alpha_0 + \xi_t$, it is always guaranteed that it will have a learning rate greater than that of Adam $\alpha = \alpha_0$. As a result, GaussianAdam is unable to enter sharp crevasses that Adam can (this is visible in Fig. \ref{fig:MNIST_iterations}.\\
+\\
+Despite the stochastic nature of the proposed algorithm, GaussianAdam still demonstrates stability. From Fig. \ref{fig:MNIST_iterations}, we see that GaussianAdam follows a trajectory comparable to that of Adam, and results in an average test accuracy (\textbf{95.52\%}) only marginally lower than that of Adam of \textbf{96.38\%} ($\Delta < 1\%$). This evidences that GaussianAdam is capable of tolerating significant noise injection.\\
+\\
+The observed stability of GaussianAdam is fundamentally driven by the proposed standard deviation decay mechanism mediated by the hyperparameter $\gamma$. As training progresses, the noise term $\xi_t$ vanishes, and the learning rate $\alpha_t$ converges back to $\alpha_0$, effectively allowing the algorithm to behave purely like Adam.\\
+\\
+\begin{table}[h]
+    \centering
+    \label{tab:mnist_runs}
+    \begin{tabular}{ccc}
+        \toprule
+        \textbf{Run \#} & \textbf{Final Training Loss} & \textbf{Test Accuracy (\%)} \\
+        \midrule
+        1 & 0.1397 & 95.34 \\
+        2 & 0.0954 & 95.82 \\
+        3 & 0.1078 & 95.47 \\
+        4 & 0.1214 & 95.40 \\
+        5 & 0.0480 & 95.62 \\
+        \midrule
+        \textbf{Mean} & \textbf{0.1025} & \textbf{95.53} \\
+        \textbf{Std Dev} & \textbf{0.0309} & \textbf{0.17} \\
+        \bottomrule
+    \end{tabular}
+    \caption{Detailed experimental results of GaussianAdam on MNIST over 5 independent runs.}
+\end{table}
+
+\subsection{Rastrigin Function}
+The Rastrigin function\cite{rastrigin1974systems} is a classical and widely used benchmark for global optimization. Since GaussianAdam is a stochastic sampler, it is imperative that its global exploration ability is evaluated. Typical deterministic gradient-descent based optimizers are known to perform poorly in such environments\cite{reddi2018adam}. The function is highly non-convex, with multiple local minima, and unique global minimum at $f(x=0) = 0$. It is defined for a vector $x \in \mathbb{R}^d$ as
+
+\begin{equation}
+    f(x) = Ad + \sum_{i=1}^{d} x_i^2 - A\cos(2\pi x_i), \qquad A = 10. \label{rastrigin_funtion}
+\end{equation}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.8\linewidth]{rastrigin.png}
+    \caption{Rastrigin Function $(A = 10)$}
+    \label{fig:rastrigin_function}
+\end{figure}
+
+For the default hyperparameters, GaussianAdam performs poorly in this benchmark -- similar to Adam or Adagrad, settling in early in a local minimum. The hyperparameters of GaussianAdam -- $\gamma$ and $\sigma_0$ must be tuned appropriately for better results.\\
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.5\linewidth]{default_rast.png}
+    \caption{Adam and GaussianAdam on the Rastrigin Function Benchmark with default hyperparameters.}
+    \label{fig:default_rast}
+\end{figure}
+
+On increasing the initial standard deviation $\sigma_0 = 10$, and decreasing the standard deviation decay $\gamma = 0.0001$, we see significantly better results, as shown in Fig.\ref{fig:tuned_rast}. In fact, one can visualize the various local minima that GaussianAdam explores in the same figure.\\
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.5\linewidth]{a0001_v10.png}
+    \caption{GaussianAdam tuned to $\gamma = 10^{-4}$ and $\sigma_0$ = 10 on the Rastrigin Function Benchmark}
+    \label{fig:tuned_rast}
+\end{figure}
+
+On running a brute-force hyperparameter search on GaussianAdam in the Rastrigin loss surface, the following results were found.
+
+\begin{table}[h]
+    \centering
+    \label{tab:hyperparams}
+    \begin{tabular}{lcc}
+        \toprule
+        \textbf{Hyperparameter} & \textbf{Search Range} & \textbf{Optimal Value} \\
+        \midrule
+        Learning Rate ($\alpha_0$) & $[0.01, 5.0]$ & 0.312 \\
+        Standard Deviation Decay ($\gamma$) & $[0.001, 0.01]$ & 0.0067 \\
+        Initial Noise Std ($\sigma_0$) & $[1, 10]$ & 10.0 \\
+        \midrule
+        \textbf{Final Loss} ($f_{min}$) & -- & \textbf{4.975} \\
+        \bottomrule
+    \end{tabular}
+    \caption{Hyperparameter search space and optimal values for GaussianAdam on the Rastrigin function.}
+\end{table}
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=\linewidth]{rast_hyperparam_search.png}
+    \caption{GaussianAdam hyperparameter search on the Rastrigin Function Loss Surface}
+    \label{fig:rast_hyperparameter_search}
+\end{figure}
+
+Although the best results are seen when initial standard deviation are high, leaving a high standard deviation unchecked by a low decay parameter $\gamma$ can cause the function to exhibit erratic convergence where the algorithm converges in worse local optima even after exploring better minima. This is demonstrated in Fig. \ref{fig:erratic_convergence_GaussianAdam_rast}
+with $\gamma = 0.0001$ and $\sigma_0 = 15$.
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=0.5\linewidth]{a0001_v15.png}
+    \caption{GaussianAdam with $\gamma$ = 0.0001 and $\sigma_o$ = 15 on the Rastrigin Loss Surface}
+    \label{fig:erratic_convergence_GaussianAdam_rast}
+\end{figure}
+
+\section{Conclusions}
+GaussianAdam, a stochastic variant of the Adam optimizer that injects decayed, positive normal noise into the learning rate is introduced in this report. It has been demonstrated that GaussianAdam on average performs (either slightly or significantly) better than or comparable to Adam on local minimization benchmarks, all the while retaining Adam-like stability and capable of tolerating significant noise injection without stalling or exploding. The algorithm is annealed by the standard deviation decay parameter $\gamma$, allowing it to behave highly stochastically during its initial steps -- encouraging exploration, and then gradually morphs into a standard deterministic Adam in its later stages. This design ensures that GaussianAdam retains the convergence guarantees of Adam -- preventing divergence, while still benefiting from initial parameter agitation.\\
+\\
+On the highly multimodal Rastrigin function, the algorithm outperformed standard baselines when tuned to a high initial variance, allowing the algorithm to exhibit a "jump-and-settle" dynamic, where high noise is required to traverse high energy barriers on the loss surface, while a low base learning rate (that the function eventually converges to) is required to settle into a stable convergence phase.\\
+\\
+GaussianAdam proves to be a robust optimizer that trades training loss precision for broader landscape exploration. On average it is capable of surpassing Adam in simple convex scenarios, and its resistance to early trapping makes it a potential candidate for complex non-convex loss surfaces.
+
+\section{Future Work}
+Continuations of this work in the future require an Ablation Study to determine whether the noise introduced in GaussianAdam is truly responsible for its performance in convex loss surfaces, or if the success can be attributed to a simple addition to the learning rate. This can be done by adding the decaying expected value curve to the learning rate directly. \\
+\\
+In this report GaussianAdam is never benchmarked against other standard global optimizers. It is imperative that GaussianAdam is tested against well-established global optimizers such as Stochastic Gradient Langevin Dynamics and AdamW (weight decay).\\
+\\
+GaussianAdam must be tested on datasets harder than MNIST to assess its accuracy further.\\
+\\
+The same algorithm can be tested out on different distributions with much heavier "tails" than the Gaussian distribution, such the Levy Alpha-Stable Distribution or Cauchy Distribution. This would allow the algorithm to make huge jumps (Levy Flights) occasionally\cite{simsekli2019tailindex}.
+\printbibliography
+
+\end{document}
